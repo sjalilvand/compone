@@ -52,3 +52,16 @@ prompt
 server.log
 # Skills directory
 /skills/
+
+# Local sandbox & build artifacts (not part of the app)
+/download/
+/upload/
+/tool-results/
+/worklog.md
+/.zscripts/
+/examples/
+/tests/
+/mini-services/
+/scripts/
+Caddyfile
+*.pid
