@@ -12,7 +12,9 @@ let zaiInitPromise: Promise<ZAIClient> | null = null
 async function getZAI(): Promise<ZAIClient> {
   if (zaiInstance) return zaiInstance
   if (!zaiInitPromise) {
-    zaiInitPromise = ZAI.create()
+    // نکته حیاتی: ZAI.create() در محیط بدون پیکربندی ممکن است برای همیشه معلق بماند؛
+    // بنابراین با سقف زمانی ۳۰ ثانیه محاصره می‌شود تا کار به‌جای «گیر کردن بی‌صدا» با پیام روشن شکست بخورد
+    zaiInitPromise = withTimeout(ZAI.create() as Promise<ZAIClient>, 30_000, 'راه‌اندازی سرویس هوش مصنوعی')
       .then((c) => {
         zaiInstance = c
         return c
@@ -31,7 +33,36 @@ async function getZAI(): Promise<ZAIClient> {
 }
 
 const TIMEOUT_MS = 60_000
-const MAX_RETRIES = 2
+const MAX_RETRIES = 3
+
+/* محدودساز نرخ سراسری — فاصله حداقلی بین فراخوانی‌های SDK (حتی بین کارهای موازی)
+   تا سقف نرخ سرویس (429) فعال نشود */
+const globalRate = globalThis as unknown as { __sdkLastCallAt?: number; __sdkWaiter?: Promise<void> }
+// ۱۲ ثانیه → حداکثر ~۳.۵ درخواست/دقیقه پایدار، زیر سقف نرخ غلتان سرویس
+const MIN_INTERVAL_MS = 12_000
+
+async function rateLimit(): Promise<void> {
+  // صف انتظار سراسری تا فراخوانی‌های هم‌زمان پشت هم نپرد
+  while (globalRate.__sdkWaiter) {
+    try {
+      await globalRate.__sdkWaiter
+    } catch {
+      /* صف فقط برای ترتیب است */
+    }
+  }
+  let release: () => void = () => {}
+  const ticket = new Promise<void>((r) => (release = r))
+  globalRate.__sdkWaiter = ticket
+  try {
+    const last = globalRate.__sdkLastCallAt ?? 0
+    const wait = last + MIN_INTERVAL_MS - Date.now()
+    if (wait > 0) await sleep(wait)
+  } finally {
+    globalRate.__sdkLastCallAt = Date.now()
+    release()
+    if (globalRate.__sdkWaiter === ticket) globalRate.__sdkWaiter = undefined
+  }
+}
 
 /** خطای عدم دسترسی به سرویس هوش مصنوعی — نباید بی‌صدا بلعیده شود */
 export class SdkUnavailableError extends Error {
@@ -65,7 +96,8 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms))
 }
 
-/** اجرای کاری با تلاش مجدد (حداکثر ۲ بار) — خطای عدم دسترسی سرویس بدون تلاش مجدد */
+/** اجرای کاری با تلاش مجدد (حداکثر ۳ بار) — خطای عدم دسترسی سرویس بدون تلاش مجدد؛
+ *  خطای 429 (محدودیت نرخ) با انتظار طولانی و تلاش مجدد مدیریت می‌شود */
 async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
   let lastErr: unknown = null
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -76,10 +108,34 @@ async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
       lastErr = e
       const msg = e instanceof Error ? e.message : String(e)
       console.warn(`[sdk] ${label} attempt ${attempt + 1} failed: ${msg}`)
-      if (attempt < MAX_RETRIES) await sleep(800 * (attempt + 1))
+      if (attempt < MAX_RETRIES) {
+        // محدودیت نرخ → انتظار بلند (پنجره سهمیه معمولا حدود یک دقیقه است)
+        if (/429|rate.?limit|too many/i.test(msg)) await sleep(20_000 * (attempt + 1))
+        else await sleep(800 * (attempt + 1))
+      }
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr))
+}
+
+/* مدارشکن 429 — شمارش شکست‌های پیاپی محدودیت نرخ؛
+   با ۳ شکست پیاپی سرویس «تخریب‌شده» تلقی می‌شود تا موتور کار را موقتاً متوقف کند */
+const globalBreaker = globalThis as unknown as { __sdk429Streak?: number }
+
+export function noteSdkSuccess(): void {
+  globalBreaker.__sdk429Streak = 0
+}
+
+export function noteSdkRateLimitFailure(): void {
+  globalBreaker.__sdk429Streak = (globalBreaker.__sdk429Streak ?? 0) + 1
+}
+
+export function isServiceDegraded(): boolean {
+  return (globalBreaker.__sdk429Streak ?? 0) >= 3
+}
+
+function isRateLimitError(msg: string): boolean {
+  return /429|rate.?limit|too many/i.test(msg)
 }
 
 export interface SearchResult {
@@ -120,16 +176,20 @@ export async function webSearch(query: string, num = 8): Promise<SearchResult[]>
   try {
     return await withRetry(async () => {
       const zai = await getZAI()
+      await rateLimit()
       const raw = await withTimeout(
         zai.functions.invoke('web_search', { query, num }) as Promise<unknown>,
         TIMEOUT_MS,
         `web_search: ${query.slice(0, 60)}`,
       )
+      noteSdkSuccess()
       return coerceResults(raw)
     }, 'web_search')
   } catch (e) {
     if (isSdkUnavailable(e)) throw e
-    console.warn(`[sdk] webSearch failed for "${query}":`, e instanceof Error ? e.message : e)
+    const msg = e instanceof Error ? e.message : String(e)
+    console.warn(`[sdk] webSearch failed for "${query}":`, msg)
+    if (isRateLimitError(msg)) noteSdkRateLimitFailure()
     return []
   }
 }
@@ -146,6 +206,7 @@ export async function readPage(url: string): Promise<PageContent | null> {
   try {
     return await withRetry(async () => {
       const zai = await getZAI()
+      await rateLimit()
       const raw = (await withTimeout(
         zai.functions.invoke('page_reader', { url }) as Promise<any>,
         TIMEOUT_MS,
@@ -162,6 +223,7 @@ export async function readPage(url: string): Promise<PageContent | null> {
               ? data.text
               : ''
       if (!html) throw new Error('پاسخ page_reader خالی بود')
+      noteSdkSuccess()
       return {
         html,
         title: typeof data?.title === 'string' ? data.title : '',
@@ -176,7 +238,9 @@ export async function readPage(url: string): Promise<PageContent | null> {
     }, 'page_reader')
   } catch (e) {
     if (isSdkUnavailable(e)) throw e
-    console.warn(`[sdk] readPage failed for "${url}":`, e instanceof Error ? e.message : e)
+    const msg = e instanceof Error ? e.message : String(e)
+    console.warn(`[sdk] readPage failed for "${url}":`, msg)
+    if (isRateLimitError(msg)) noteSdkRateLimitFailure()
     return null
   }
 }
@@ -185,6 +249,7 @@ export async function readPage(url: string): Promise<PageContent | null> {
 export async function chat(system: string, user: string, opts?: { maxTokens?: number }): Promise<string> {
   return withRetry(async () => {
     const zai = await getZAI()
+    await rateLimit()
     const completion = await withTimeout(
       zai.chat.completions.create({
         messages: [
@@ -199,6 +264,7 @@ export async function chat(system: string, user: string, opts?: { maxTokens?: nu
     )
     const content = completion?.choices?.[0]?.message?.content
     if (typeof content !== 'string' || !content.trim()) throw new Error('پاسخ LLM خالی بود')
+    noteSdkSuccess()
     return content
   }, 'chat')
 }
@@ -279,11 +345,13 @@ const TEXT_CAP = 12000
 const HEAD = 6000
 const TAIL = 6000
 
-/** بررسی سلامت سرویس هوش مصنوعی — تماس بسیار سبک با سقف ۲۰ ثانیه */
-export async function sdkHealthCheck(): Promise<{ ok: boolean; message: string | null }> {
+/** بررسی سلامت سرویس هوش مصنوعی — تماس بسیار سبک با سقف ۲۰ ثانیه؛
+ *  unavailable=true یعنی پیکربندی موجود نیست (دائمی)، unavailable=false یعنی خطای گذرا (مثل 429) */
+export async function sdkHealthCheck(): Promise<{ ok: boolean; message: string | null; unavailable: boolean }> {
   try {
     await withRetry(async () => {
       const zai = await getZAI()
+      await rateLimit()
       await withTimeout(
         zai.chat.completions.create({
           messages: [{ role: 'user', content: 'ping' }],
@@ -294,10 +362,14 @@ export async function sdkHealthCheck(): Promise<{ ok: boolean; message: string |
         'health-check',
       )
     }, 'health-check')
-    return { ok: true, message: null }
+    return { ok: true, message: null, unavailable: false }
   } catch (e) {
-    if (isSdkUnavailable(e)) return { ok: false, message: e.message }
-    return { ok: false, message: `سرویس هوش مصنوعی پاسخ نداد: ${e instanceof Error ? e.message : String(e)}` }
+    if (isSdkUnavailable(e)) return { ok: false, message: e.message, unavailable: true }
+    return {
+      ok: false,
+      message: `سرویس هوش مصنوعی پاسخ نداد: ${e instanceof Error ? e.message : String(e)}`,
+      unavailable: false,
+    }
   }
 }
 

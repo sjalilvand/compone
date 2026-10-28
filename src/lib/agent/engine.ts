@@ -1,7 +1,7 @@
 // موتور ایجنت کراول — اجرای درون‌پردازشی با نقاط بازرسی و امکان ادامه از سر
 
 import { db } from '@/lib/db'
-import { webSearch, readPage, chatJSON, htmlToText, isSdkUnavailable, sdkHealthCheck } from './sdk'
+import { webSearch, readPage, chatJSON, htmlToText, isSdkUnavailable, sdkHealthCheck, isServiceDegraded } from './sdk'
 import {
   buildQueryPlanningPrompt,
   buildDiscoveryPrompt,
@@ -25,7 +25,10 @@ export interface CandidateState {
   note?: string
 }
 
-const running = new Map<string, () => void>()
+// Map مشترک روی globalThis — در حالت dev هر route ممکن است نمونه جدا از این ماژول داشته باشد؛
+// بدون این، یک نمونه با Map خالی کارهای زندهٔ نمونه دیگر را متوقف می‌کند
+const globalRef = globalThis as unknown as { __crawlRunningMap?: Map<string, () => void> }
+const running: Map<string, () => void> = globalRef.__crawlRunningMap ?? (globalRef.__crawlRunningMap = new Map())
 let recovered = false
 
 /** بازیابی کارهای نیمه‌تمام پس از ری‌استارت پروسه */
@@ -35,6 +38,8 @@ export async function ensureJobRecovery(): Promise<void> {
   try {
     const stuck = await db.crawlJob.findMany({ where: { status: 'running' }, select: { id: true } })
     for (const j of stuck) {
+      // اگر کار در همین پروسه واقعاً زنده است، هرگز paused نشود
+      if (running.has(j.id)) continue
       await db.crawlJob.update({ where: { id: j.id }, data: { status: 'paused' } })
       await db.auditLog.create({
         data: {
@@ -103,7 +108,7 @@ function appendErrors(existing: string | null, message: string): string {
   return JSON.stringify(arr.slice(-100))
 }
 
-/** بازرسی توقف/بودجه — در صورت نیاز وضعیت را به paused می‌برد */
+/** بازرسی توقف/بودجه/سلامت سرویس — در صورت نیاز وضعیت را به paused می‌برد */
 async function shouldStop(jobId: string): Promise<boolean> {
   const job = await db.crawlJob.findUnique({ where: { id: jobId } })
   if (!job) return true
@@ -111,6 +116,21 @@ async function shouldStop(jobId: string): Promise<boolean> {
     if (job.status === 'stopping') {
       await db.crawlJob.update({ where: { id: jobId }, data: { status: 'paused' } })
     }
+    return true
+  }
+  // مدارشکن: سرویس به‌طور پیاپی 429 می‌دهد → توقف موقت برای جلوگیری از هدررفت بودجه و نامزدها
+  if (isServiceDegraded()) {
+    await db.crawlJob.update({
+      where: { id: jobId },
+      data: {
+        status: 'paused',
+        errorsLog: appendErrors(
+          job.errorsLog,
+          'سرویس هوش مصنوعی پیاپی محدودشده است (429) — کار برای جلوگیری از هدررفت بودجه موقتاً متوقف شد؛ کمی بعد «ادامه» را بزنید.',
+        ),
+      },
+    })
+    console.warn('[engine] circuit-breaker: service degraded, job paused:', jobId)
     return true
   }
   if (job.requestsMade >= job.maxRequests) {
@@ -570,23 +590,27 @@ async function runJob(jobId: string): Promise<void> {
 
     const checkStop = () => shouldStop(jobId)
 
-    // بررسی سلامت سرویس — پیش از هر هزینه‌ای، تا کار به‌جای «تکمیل بی‌نتیجه» با پیام روشن شکست بخورد
+    // بررسی سلامت سرویس — پیش از هر هزینه‌ای، تا کار به‌جای «تکمیل بی‌نتیجه» با پیام روشن متوقف/شکست بخورد
     const health = await sdkHealthCheck()
     if (!health.ok) {
       const jobRow = await db.crawlJob.findUnique({ where: { id: jobId }, select: { errorsLog: true } })
+      // خطای دائمی (نبود پیکربندی) → failed؛ خطای گذرا (مثل 429 محدودیت نرخ) → paused قابل ادامه
+      const permanent = health.unavailable
       await db.crawlJob.update({
         where: { id: jobId },
         data: {
-          status: 'failed',
+          status: permanent ? 'failed' : 'paused',
           currentStage: 'planning',
-          finishedAt: new Date(),
+          finishedAt: permanent ? new Date() : null,
           errorsLog: appendErrors(
             jobRow?.errorsLog ?? null,
-            `کشف هوشمند در دسترس نیست: ${health.message}`,
+            permanent
+              ? `کشف هوشمند در دسترس نیست: ${health.message}`
+              : `سرویس هوش مصنوعی موقتاً پاسخ نداد (${health.message ?? 'خطای نامشخص'}) — کار برای ادامه بعدی متوقف شد؛ چند لحظه دیگر «ادامه» را بزنید.`,
           ),
         },
       })
-      console.error('[engine] job aborted — SDK unavailable:', health.message)
+      console.error(`[engine] job halted at health-check — permanent=${permanent}:`, health.message)
       return
     }
 
