@@ -1,7 +1,8 @@
 'use client'
 
 import { useState } from 'react'
-import { Building2, Download, FileSpreadsheet, RefreshCw, MapPinned } from 'lucide-react'
+import Link from 'next/link'
+import { BarChart3, Building2, Download, FileSpreadsheet, RefreshCw, MapPinned } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
   DropdownMenu,
@@ -58,6 +59,16 @@ export function AdminHeader({ runningJobs, onSwitchTab, onRefresh, regions }: Ad
 
         {/* بخش چپ: ابزارها */}
         <div className="flex items-center gap-2">
+          {/* پیوند به داشبورد تحلیلی */}
+          <Link
+            href="/dashboard"
+            className="inline-flex items-center gap-2 rounded-md border border-white/30 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-white/10"
+            aria-label="مشاهده داشبورد تحلیلی خروجی‌ها"
+          >
+            <BarChart3 className="size-4" aria-hidden="true" />
+            <span className="hidden sm:inline">داشبورد تحلیلی</span>
+          </Link>
+
           {/* نشانگر کارهای در حال اجرا */}
           {runningJobs > 0 && (
             <button
