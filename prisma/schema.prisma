@@ -1,0 +1,199 @@
+// سامانه بانک اطلاعات شرکت‌ها و کارخانه‌های ایران
+// SQLite — فیلدهای لیستی به صورت رشته JSON ذخیره می‌شوند
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// شرکت / کارخانه
+model Company {
+  id                  String   @id @default(cuid())
+  officialName        String
+  normalizedName      String // کلید نرمال‌شده برای حذف تکراری
+  brandName           String?
+  alternateNames      String? // JSON string array
+  nationalId          String?
+  registrationNumber  String?
+  entityType          String   @default("company") // company | factory | other
+  ownershipType       String   @default("unknown") // state | semi_state | private | unknown
+  activityStatus      String   @default("unknown") // active | semi_active | inactive | unknown
+  activityDescription String?
+  affiliationName     String? // وابسته به وزارت/سازمان/هلدینگ
+  website             String?
+  reviewStatus        String   @default("ai_extracted") // ai_extracted | human_verified | rejected
+  needsReview         Boolean  @default(false)
+  reviewReason        String?
+  sourceJobId         String?
+  firstSeenAt         DateTime @default(now())
+  lastCheckedAt       DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  mergedIntoId        String?
+
+  locations          CompanyLocation[]
+  contacts           CompanyContact[]
+  officers           CompanyOfficer[]
+  cooperationRecords CooperationRecord[]
+  evidence           FieldEvidence[]
+
+  @@index([normalizedName])
+  @@index([reviewStatus])
+  @@index([needsReview])
+}
+
+// محل (دفتر مرکزی / کارخانه / شعبه / دفتر فروش)
+model CompanyLocation {
+  id            String  @id @default(cuid())
+  companyId     String
+  company       Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  locationType  String  @default("hq") // hq | factory | branch | sales_office
+  name          String?
+  province      String?
+  city          String?
+  county        String?
+  address       String?
+  postalCode    String?
+  currentStatus String? // active | inactive | unknown
+
+  @@index([companyId])
+  @@index([province])
+  @@index([city])
+}
+
+// اطلاعات تماس
+model CompanyContact {
+  id               String  @id @default(cuid())
+  companyId        String
+  company          Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  locationId       String?
+  contactType      String // phone | mobile | fax | email
+  value            String
+  valueOriginal    String?
+  unitTitle        String?
+  isPublic         Boolean @default(true)
+  validationStatus String  @default("unverified") // unverified | verified | rejected
+
+  @@index([companyId])
+}
+
+// مدیران (مدیرعامل / رئیس هیئت‌مدیره)
+model CompanyOfficer {
+  id         String  @id @default(cuid())
+  companyId  String
+  company    Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  personName String
+  role       String  @default("ceo") // ceo | chairman | other
+  startDate  String?
+  endDate    String?
+  isCurrent  Boolean @default(true)
+  sourceUrl  String?
+
+  @@index([companyId])
+}
+
+// سابقه همکاری با کمیته امداد و سایر سازمان‌ها
+model CooperationRecord {
+  id                 String   @id @default(cuid())
+  companyId          String
+  company            Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  organization       String   @default("کمیته امداد امام خمینی")
+  cooperationType    String?
+  dateText           String?
+  description        String?
+  sourceUrl          String?
+  verificationStatus String   @default("unverified") // unverified | verified | rejected
+  enteredBy          String   @default("agent") // agent | human
+  createdAt          DateTime @default(now())
+
+  @@index([companyId])
+}
+
+// منبع وب
+model Source {
+  id           String   @id @default(cuid())
+  url          String
+  title        String?
+  publisher    String?
+  sourceType   String   @default("other") // official | guild | news | directory | other
+  fetchedAt    DateTime @default(now())
+  publishedAt  DateTime?
+  accessStatus String   @default("ok") // ok | failed | partial
+  contentHash  String?
+
+  evidence FieldEvidence[]
+
+  @@index([url])
+}
+
+// شواهد میدانی — هر فیلد استخراج‌شده باید شاهد داشته باشد
+model FieldEvidence {
+  id            String   @id @default(cuid())
+  companyId     String
+  company       Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  entityType    String   @default("company") // company | location | contact | officer | cooperation
+  entityId      String?
+  fieldName     String // company_name, ownership_type, activity_status, activity_description, emdad_cooperation, ceo_name, company_phone, ceo_phone, address, province, website, ...
+  claimedValue  String?
+  sourceId      String?
+  source        Source?  @relation(fields: [sourceId], references: [id])
+  quoteText     String?
+  effectiveDate String?
+  confidence    Int      @default(0) // 0..100
+  reviewStatus  String   @default("pending") // pending | approved | rejected
+  conflict      Boolean  @default(false)
+  createdAt     DateTime @default(now())
+
+  @@index([companyId])
+  @@index([fieldName])
+  @@index([conflict])
+}
+
+// کار کراول
+model CrawlJob {
+  id                    String    @id @default(cuid())
+  name                  String?
+  provinces             String // JSON string array
+  cities                String    @default("[]") // JSON string array
+  companyTypes          String    @default("[]") // JSON string array
+  seedQueries           String? // JSON string array
+  maxRequests           Int       @default(200)
+  requestsMade          Int       @default(0)
+  status                String    @default("pending") // pending | running | paused | stopping | completed | failed
+  currentStage          String? // planning | discovering | researching | done
+  progressDone          Int       @default(0)
+  progressTotal         Int       @default(0)
+  queriesState          String? // JSON [{q,done}]
+  candidatesState       String? // JSON [{name,url?,processed}]
+  statsSourcesChecked   Int       @default(0)
+  statsNewCompanies     Int       @default(0)
+  statsUpdatedCompanies Int       @default(0)
+  statsUncertain        Int       @default(0)
+  statsErrors           Int       @default(0)
+  errorsLog             String? // JSON [{time,message}]
+  startedAt             DateTime?
+  finishedAt            DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+}
+
+// لاگ حسابرسی — تمام تغییرات مهم
+model AuditLog {
+  id         String   @id @default(cuid())
+  entityType String // company | contact | officer | location | evidence | job
+  entityId   String?
+  fieldName  String?
+  oldValue   String?
+  newValue   String?
+  reason     String?
+  actor      String   @default("agent") // agent | human | system
+  jobId      String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType])
+  @@index([createdAt])
+}
