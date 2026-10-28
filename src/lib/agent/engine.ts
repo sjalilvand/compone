@@ -1,7 +1,7 @@
 // موتور ایجنت کراول — اجرای درون‌پردازشی با نقاط بازرسی و امکان ادامه از سر
 
 import { db } from '@/lib/db'
-import { webSearch, readPage, chatJSON, htmlToText } from './sdk'
+import { webSearch, readPage, chatJSON, htmlToText, isSdkUnavailable, sdkHealthCheck } from './sdk'
 import {
   buildQueryPlanningPrompt,
   buildDiscoveryPrompt,
@@ -570,6 +570,26 @@ async function runJob(jobId: string): Promise<void> {
 
     const checkStop = () => shouldStop(jobId)
 
+    // بررسی سلامت سرویس — پیش از هر هزینه‌ای، تا کار به‌جای «تکمیل بی‌نتیجه» با پیام روشن شکست بخورد
+    const health = await sdkHealthCheck()
+    if (!health.ok) {
+      const jobRow = await db.crawlJob.findUnique({ where: { id: jobId }, select: { errorsLog: true } })
+      await db.crawlJob.update({
+        where: { id: jobId },
+        data: {
+          status: 'failed',
+          currentStage: 'planning',
+          finishedAt: new Date(),
+          errorsLog: appendErrors(
+            jobRow?.errorsLog ?? null,
+            `کشف هوشمند در دسترس نیست: ${health.message}`,
+          ),
+        },
+      })
+      console.error('[engine] job aborted — SDK unavailable:', health.message)
+      return
+    }
+
     // STAGE planning
     let queries = parseJson<QueryState[]>(job.queriesState, [])
     if (!queries.length) {
@@ -641,6 +661,7 @@ async function runJob(jobId: string): Promise<void> {
       try {
         await researchCandidate(jobId, cand, checkStop)
       } catch (e) {
+        if (isSdkUnavailable(e)) throw e
         cand.note = 'خطا در پژوهش نامزد'
         await bumpStat(jobId, 'statsErrors')
         const jobRow = await db.crawlJob.findUnique({ where: { id: jobId }, select: { errorsLog: true } })

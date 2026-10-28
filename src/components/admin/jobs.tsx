@@ -47,6 +47,8 @@ export function JobsTab({ onRunningCountChange }: JobsTabProps) {
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const jobs = data?.items ?? []
+  const failedJobs = useMemo(() => jobs.filter((j) => j.status === 'failed'), [jobs])
+  const lastFailedError = failedJobs[0]?.errors?.[failedJobs[0].errors.length - 1]?.message ?? null
   const hasActive = useMemo(
     () => jobs.some((j) => j.status === 'running' || j.status === 'stopping'),
     [jobs],
@@ -105,6 +107,23 @@ export function JobsTab({ onRunningCountChange }: JobsTabProps) {
         <Alert variant="destructive">
           <XCircle className="size-4" aria-hidden="true" />
           <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+
+      {/* هشدار کارهای ناموفق — علت آخرین شکست به‌صورت شفاف نمایش داده می‌شود */}
+      {failedJobs.length > 0 && (
+        <Alert className="border-red-300 bg-red-50">
+          <XCircle className="size-4 text-red-700" aria-hidden="true" />
+          <AlertDescription className="text-xs leading-6 text-red-900">
+            <span className="font-bold">{faNum(failedJobs.length)} کار ناموفق ثبت شده است.</span>
+            {lastFailedError && <> آخرین علت: {lastFailedError}</>}
+            {lastFailedError?.includes('کشف هوشمند در دسترس نیست') && (
+              <span className="mt-1 block">
+                راهنما: این سامانه برای کشف شرکت‌ها به اعتبارنامه سرویس Z.ai نیاز دارد. بدون آن، پنل، داشبورد و خروجی اکسل کار می‌کنند
+                اما اجرای کشف جدید ممکن نیست.
+              </span>
+            )}
+          </AlertDescription>
         </Alert>
       )}
 

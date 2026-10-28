@@ -12,16 +12,38 @@ let zaiInitPromise: Promise<ZAIClient> | null = null
 async function getZAI(): Promise<ZAIClient> {
   if (zaiInstance) return zaiInstance
   if (!zaiInitPromise) {
-    zaiInitPromise = ZAI.create().then((c) => {
-      zaiInstance = c
-      return c
-    })
+    zaiInitPromise = ZAI.create()
+      .then((c) => {
+        zaiInstance = c
+        return c
+      })
+      .catch((e: unknown) => {
+        // اجازه تلاش مجدد پس از رفع پیکربندی بدون ری‌استارت
+        zaiInitPromise = null
+        zaiInstance = null
+        const detail = e instanceof Error ? e.message : String(e)
+        throw new SdkUnavailableError(
+          `اتصال به سرویس هوش مصنوعی و جست‌وجوی وب برقرار نشد (${detail}) — برای فعال‌سازی کشف هوشمند، فایل پیکربندی .z-ai-config باید در ریشه پروژه یا پوشه کاربری موجود باشد.`,
+        )
+      })
   }
   return zaiInitPromise
 }
 
 const TIMEOUT_MS = 60_000
 const MAX_RETRIES = 2
+
+/** خطای عدم دسترسی به سرویس هوش مصنوعی — نباید بی‌صدا بلعیده شود */
+export class SdkUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'SdkUnavailableError'
+  }
+}
+
+export function isSdkUnavailable(e: unknown): boolean {
+  return e instanceof SdkUnavailableError
+}
 
 function withTimeout<T>(p: Promise<T>, ms = TIMEOUT_MS, label = 'operation'): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -43,13 +65,14 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms))
 }
 
-/** اجرای کاری با تلاش مجدد (حداکثر ۲ بار) */
+/** اجرای کاری با تلاش مجدد (حداکثر ۲ بار) — خطای عدم دسترسی سرویس بدون تلاش مجدد */
 async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
   let lastErr: unknown = null
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
       return await fn()
     } catch (e) {
+      if (isSdkUnavailable(e)) throw e
       lastErr = e
       const msg = e instanceof Error ? e.message : String(e)
       console.warn(`[sdk] ${label} attempt ${attempt + 1} failed: ${msg}`)
@@ -92,7 +115,7 @@ function coerceResults(raw: any): SearchResult[] {
   return out
 }
 
-/** جست‌وجوی وب — همیشه آرایه برمی‌گرداند */
+/** جست‌وجوی وب — خطای عدم دسترسی سرویس منتقل می‌شود، سایر خطاها آرایه خالی */
 export async function webSearch(query: string, num = 8): Promise<SearchResult[]> {
   try {
     return await withRetry(async () => {
@@ -105,6 +128,7 @@ export async function webSearch(query: string, num = 8): Promise<SearchResult[]>
       return coerceResults(raw)
     }, 'web_search')
   } catch (e) {
+    if (isSdkUnavailable(e)) throw e
     console.warn(`[sdk] webSearch failed for "${query}":`, e instanceof Error ? e.message : e)
     return []
   }
@@ -151,6 +175,7 @@ export async function readPage(url: string): Promise<PageContent | null> {
       }
     }, 'page_reader')
   } catch (e) {
+    if (isSdkUnavailable(e)) throw e
     console.warn(`[sdk] readPage failed for "${url}":`, e instanceof Error ? e.message : e)
     return null
   }
@@ -233,7 +258,7 @@ function extractJsonBlock(text: string): string | null {
   return null
 }
 
-/** گفت‌وگو با خروجی JSON — در خطا null */
+/** گفت‌وگو با خروجی JSON — در خطای عدم دسترسی سرویس منتقل می‌شود، سایر خطاها null */
 export async function chatJSON<T>(system: string, user: string, opts?: { maxTokens?: number }): Promise<T | null> {
   try {
     const text = await chat(system, user, opts)
@@ -244,6 +269,7 @@ export async function chatJSON<T>(system: string, user: string, opts?: { maxToke
     }
     return JSON.parse(block) as T
   } catch (e) {
+    if (isSdkUnavailable(e)) throw e
     console.warn('[sdk] chatJSON failed:', e instanceof Error ? e.message : e)
     return null
   }
@@ -252,6 +278,28 @@ export async function chatJSON<T>(system: string, user: string, opts?: { maxToke
 const TEXT_CAP = 12000
 const HEAD = 6000
 const TAIL = 6000
+
+/** بررسی سلامت سرویس هوش مصنوعی — تماس بسیار سبک با سقف ۲۰ ثانیه */
+export async function sdkHealthCheck(): Promise<{ ok: boolean; message: string | null }> {
+  try {
+    await withRetry(async () => {
+      const zai = await getZAI()
+      await withTimeout(
+        zai.chat.completions.create({
+          messages: [{ role: 'user', content: 'ping' }],
+          thinking: { type: 'disabled' },
+          max_tokens: 4,
+        }) as Promise<unknown>,
+        20_000,
+        'health-check',
+      )
+    }, 'health-check')
+    return { ok: true, message: null }
+  } catch (e) {
+    if (isSdkUnavailable(e)) return { ok: false, message: e.message }
+    return { ok: false, message: `سرویس هوش مصنوعی پاسخ نداد: ${e instanceof Error ? e.message : String(e)}` }
+  }
+}
 
 /** تبدیل HTML به متن خالص — با سقف ۱۲۰۰۰ نویسه (برش میانه با حفظ ابتدا و انتها) */
 export function htmlToText(html: string): string {

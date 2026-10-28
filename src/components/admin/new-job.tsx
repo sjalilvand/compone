@@ -39,6 +39,7 @@ interface NewJobTabProps {
 /** زبانه اجرای جدید — فرم تعریف محدوده و پارامترهای کار کراول */
 export function NewJobTab({ onCreated }: NewJobTabProps) {
   const { data: regions, loading: regionsLoading } = useApi<RegionsResponse>('/api/regions')
+  const { data: health } = useApi<{ ok: boolean; message: string | null }>('/api/health/sdk')
 
   const [name, setName] = useState('')
   const [selectedProvinces, setSelectedProvinces] = useState<string[]>([])
@@ -132,6 +133,17 @@ export function NewJobTab({ onCreated }: NewJobTabProps) {
 
   return (
     <div className="space-y-6">
+      {/* هشدار پیش‌از-اجرای: سرویس هوش مصنوعی/جست‌وجو در دسترس نیست */}
+      {health && !health.ok && (
+        <Alert className="border-amber-300 bg-amber-50">
+          <ShieldAlert className="size-4 text-amber-700" aria-hidden="true" />
+          <AlertDescription className="text-xs leading-6 text-amber-900">
+            <span className="font-bold">سرویس کشف هوشمند در این محیط فعال نیست —</span> اجرای جدید هنگام شروع با خطا متوقف خواهد شد و
+            هیچ جست‌وجوی وبی انجام نمی‌شود. علت: {health.message}
+          </AlertDescription>
+        </Alert>
+      )}
+
       <Card className="border shadow-sm">
         <CardHeader className="pb-2">
           <CardTitle className="flex items-center gap-2 text-lg text-[#1e2f4d]">
